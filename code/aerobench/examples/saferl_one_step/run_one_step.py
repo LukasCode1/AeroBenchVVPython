@@ -96,6 +96,11 @@ def main():
 
     init_x = csvdata[(0, aircraft_str)]['x']
     init_y = csvdata[(0, aircraft_str)]['y']
+
+    print("!! overwriting init_x and y")
+    init_x = 8013
+    init_y = 7724
+
     init_heading = csvdata[(0, aircraft_str)]['heading']
     init_v = csvdata[(0, aircraft_str)]['v']
 
@@ -147,11 +152,11 @@ def main():
 
     ##################################
 
-    tmax = 1 # simulation time
+    tmax = 130.0 # simulation time
     #tmax = 132 # simulation time
 
-    step = 1.0 #1/30
-    extended_states = False
+    step = 1/30
+    extended_states = True
     res = my_run_f16_sim(init, tmax, ap, step=step, extended_states=extended_states, integrator_str='rk45')
     #print(f"res.keys(): {res.keys()}")
     # print(f"res['states']: {res['states']}")
@@ -165,6 +170,12 @@ def main():
     plt.savefig(filename)
     print(f"Made {filename}")
 
+     # vt
+    plot.plot_single(res, 'psi', title='Velocity (ft/sec)')
+    filename = 'psi.png'
+    plt.savefig(filename)
+    print(f"Made {filename}")
+
     # vt
     plot.plot_single(res, 'vt', title='Velocity (ft/sec)')
     filename = 'vel.png'
@@ -173,6 +184,23 @@ def main():
 
     plot.plot_overhead(res)
     filename = 'overhead.png'
+    plt.savefig(filename)
+    print(f"Made {filename}")
+
+    plot.plot_attitude(res)
+    filename = 'attitude.png'
+    plt.savefig(filename)
+    print(f"Made {filename}")
+
+    # plot inner loop controls + references
+    plot.plot_inner_loop(res)
+    filename = 'inner_loop.png'
+    plt.savefig(filename)
+    print(f"Made {filename}")
+
+    # plot outer loop controls + references
+    plot.plot_outer_loop(res, show=False)
+    filename = 'outer_loop.png'
     plt.savefig(filename)
     print(f"Made {filename}")
 

@@ -34,6 +34,9 @@ def controlled_f16(t, x_f16, u_ref, llc, f16_model='morelli', v2_integrators=Fal
         Ny_r = Ny + xd_model[8]
     else:
         # Nonlinear (Actual): ps = p * cos(alpha) + r * sin(alpha)
+        #print(f"STAN: p: {x_ctrl[4]:.12f}, r: {x_ctrl[5]:.12f}, alpha: {x_ctrl[0]:.12f}")
+        #exit(1)
+
         ps = x_ctrl[4] * cos(x_ctrl[0]) + x_ctrl[5] * sin(x_ctrl[0])
 
         # Calculate (side force + yaw rate) term

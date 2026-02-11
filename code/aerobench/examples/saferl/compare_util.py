@@ -1,5 +1,6 @@
 import pickle
 import os
+import time
 from cachier import cachier
 import numpy as np
 from numpy import deg2rad
@@ -10,8 +11,10 @@ from aerobench.run_f16_sim import run_f16_sim, F16SimState
 from aerobench.visualize import plot
 from wingman_autopilot import WingmanAutopilot
 
-from scipy.optimize import linprog
+from scipy.optimize import linprog as linprog_scipy
 from scipy.io import savemat
+
+from linprog_glpk import linprog as linprog_glpk
 
 class DubinsPredictor:
     '''predictor using dubins car model'''
@@ -59,6 +62,8 @@ def linf_best_fit(input_array, output_array):
         output_array: (M, K) array of outputs
 
     Returns:
+        str: error message if LP fails
+         -- or --
         A_lstsq: (K, N) array of solutions (each row corresponds to one output dimension)
         linf_lstsq_residuals: (K,) array of L_inf residuals per output dimension
         linf_minimize_residuals: (K,) array of sum of absolute residuals per output dimension
@@ -108,9 +113,14 @@ def linf_best_fit(input_array, output_array):
         b_ub = np.array(b_ub_list)
 
         # Solve LP
-        result = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
+        start = time.time()
+        #result = linprog_glpk(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds) # ill-conditioned errors
+        result = linprog_scipy(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
+        end = time.time()
+        print(f"{k_idx=}, linprog time: {end - start:.3f} seconds")
         if not result.success:
-            raise ValueError(f"L_inf optimization failed for output dimension {k_idx}: {result.message}")
+            #raise ValueError(f"L_inf optimization failed for output dimension {k_idx}: {result.message}")
+            return f"L_inf optimization failed for output dimension {k_idx}: {result.message}"
 
         x_solution = result.x[:-1]
         A_list.append(x_solution)
@@ -147,7 +157,9 @@ class RegressionPredictor:
         for _, res_dict in enumerate(all_f16_res_dicts):
             f16_np_states, actions_rollout = extract_np_states_actions(res_dict)
 
-            for start_step in range(len(f16_np_states) - (num_steps + 1)):
+            start_step_range = range(len(f16_np_states) - (num_steps))
+            #print(f"start_step_range for num_steps={num_steps}: {list(start_step_range)}")
+            for start_step in start_step_range:
                 #state0 = f16_np_states[start_step].copy()
 
                 #actions_rollout_trimmed = actions_rollout[:, start_step:start_step+(num_steps)]
@@ -157,15 +169,22 @@ class RegressionPredictor:
 
                 input_list.append(input_obs)
                 output_list.append(output_obs)
-
                 #print(f"{input_obs=}, {output_obs=}")
         
         input_array = np.array(input_list)
         output_array = np.array(output_list)
 
-        A, residuals = linf_best_fit(input_array, output_array)
-        print(f"{num_steps=}, {A.shape=}, {residuals=}")
- 
+        while True:
+            res = linf_best_fit(input_array, output_array)
+
+            if isinstance(res, str):
+                print(f"{num_steps=}, LP-error:{res}, retrying with half of data")
+                input_array = input_array[:len(input_array)//2]
+                output_array = output_array[:len(output_array)//2]
+            else:
+                A, residuals = res
+                break
+
         self.A_dict[num_steps] = A
         self.residuals_dict[num_steps] = residuals
 
@@ -175,98 +194,125 @@ class RegressionPredictor:
         assert num_steps_to_predict in self.A_dict, f"A matrix not set for {num_steps_to_predict=}. call fit() first"
         A = self.A_dict[num_steps_to_predict]
 
-        #print(f'predict() with {num_steps_to_predict=} {A.shape=}')
-
         input_obs = self.input_obs_func(res_dict, start_step, num_steps_to_predict)
         predicted_output = input_obs @ A.T
         
         return predicted_output
 
+def input_obs_func(res_dict, start_step, num_steps):
+    '''return the input observation vector'''
 
+    list_of_arrays = []
+
+    f16_state_13d = res_dict['states'][start_step]
+
+    # dubins state
+    x = f16_state_13d[StateIndex.POS_E]
+    y = f16_state_13d[StateIndex.POS_N]
+    heading = np.pi / 2 - f16_state_13d[StateIndex.PSI]
+    vel = f16_state_13d[StateIndex.VT]
+
+    dubins_state = np.array([x, y, heading, vel, vel*np.cos(heading), vel*np.sin(heading)])
+    list_of_arrays.append(dubins_state)
+
+    # add f16 state
+    list_of_arrays.append(f16_state_13d)
+    dubins_rollout_cur_state = dubins_state.copy() # also do a dubins rollout as part of the observation
+    ideal_dubins_rollout_cur_state = dubins_state.copy()
+
+    # use res_dict['vel_targets'] and res_dict['psi_targets'] to get the ideal dubins rollout
+    ideal_dubins_rollout_cur_state[3] = res_dict['vel_targets'][start_step]
+    ideal_dubins_rollout_cur_state[2] = np.pi / 2 - res_dict['psi_targets'][start_step]
+
+    #list_of_arrays.append([res_dict['vel_targets'][start_step], np.pi / 2 - res_dict['psi_targets'][start_step]])
+        
+    for step in range(start_step, start_step + num_steps):
+        action = res_dict['actions'][:, step]
+        list_of_arrays.append(action)
+
+        # apply action to get next state
+        next_state = dubins_rollout_cur_state.copy()
+        next_state[0] = dubins_rollout_cur_state[0] + dubins_rollout_cur_state[3] * np.cos(dubins_rollout_cur_state[2])
+        next_state[1] = dubins_rollout_cur_state[1] + dubins_rollout_cur_state[3] * np.sin(dubins_rollout_cur_state[2])
+        next_state[2] = dubins_rollout_cur_state[2] + action[0] # update theta
+        next_state[3] = dubins_rollout_cur_state[3] + action[1] # update vel
+        next_state[4] = next_state[3] * np.cos(next_state[2])
+        next_state[5] = next_state[3] * np.sin(next_state[2])
+
+        next_ideal_state = ideal_dubins_rollout_cur_state.copy()
+        next_ideal_state[0] = ideal_dubins_rollout_cur_state[0] + ideal_dubins_rollout_cur_state[3] * np.cos(ideal_dubins_rollout_cur_state[2])
+        next_ideal_state[1] = ideal_dubins_rollout_cur_state[1] + ideal_dubins_rollout_cur_state[3] * np.sin(ideal_dubins_rollout_cur_state[2])
+        next_ideal_state[2] = ideal_dubins_rollout_cur_state[2] + action[0] # update theta
+        next_ideal_state[3] = ideal_dubins_rollout_cur_state[3] + action[1] # update vel
+        next_ideal_state[4] = next_ideal_state[3] * np.cos(next_ideal_state[2])
+        next_ideal_state[5] = next_ideal_state[3] * np.sin(next_ideal_state[2])
+        
+        dubins_rollout_cur_state = next_state
+        ideal_dubins_rollout_cur_state = next_ideal_state
+
+        LAST_N_STEPS = np.inf
+        if step >= start_step + num_steps - LAST_N_STEPS:
+            # add the last few state
+            list_of_arrays.append(dubins_rollout_cur_state)
+            list_of_arrays.append(ideal_dubins_rollout_cur_state)
+
+    # also add vel and theta targets
+    #list_of_arrays.append([]])
+
+    list_of_arrays.append([1]) # identity term for constant offsets
+
+    return np.concatenate(list_of_arrays)
+
+def output_obs_func(res_dict, step, num_steps):
+    '''return the output observation vector'''
+
+    f16_state_13d = res_dict['states'][step]
+    x = f16_state_13d[StateIndex.POS_E]
+    y = f16_state_13d[StateIndex.POS_N]
+    heading = np.pi / 2 - f16_state_13d[StateIndex.PSI]
+    vel = f16_state_13d[StateIndex.VT]
     
-def make_linear_predictor(all_f16_res_dicts, MAX_STEPS):
+    return np.array([x, y, heading, vel])
+    
+#@cachier(cache_dir='./cachier')
+def make_linear_predictor(all_f16_res_dicts, MAX_STEPS, trim_to_max_steps=False):
     '''make a RegressionPredictor from the passed-in data'''
 
-    def input_obs_func(res_dict, start_step, num_steps):
-        '''return the input observation vector'''
-
-        list_of_arrays = []
-
-        f16_state_13d = res_dict['states'][start_step]
-
-        # dubins state
-        x = f16_state_13d[StateIndex.POS_E]
-        y = f16_state_13d[StateIndex.POS_N]
-        heading = np.pi / 2 - f16_state_13d[StateIndex.PSI]
-        vel = f16_state_13d[StateIndex.VT]
-
-        dubins_state = np.array([x, y, heading, vel, vel*np.cos(heading), vel*np.sin(heading)])
-        list_of_arrays.append(dubins_state)
-
-        # add f16 state
-        list_of_arrays.append(f16_state_13d)
-        dubins_rollout_cur_state = dubins_state.copy() # also do a dubins rollout as part of the observation
-        ideal_dubins_rollout_cur_state = dubins_state.copy()
-
-        # use res_dict['vel_targets'] and res_dict['psi_targets'] to get the ideal dubins rollout
-        ideal_dubins_rollout_cur_state[3] = res_dict['vel_targets'][start_step]
-        ideal_dubins_rollout_cur_state[2] = np.pi / 2 - res_dict['psi_targets'][start_step]
-
-        #list_of_arrays.append([res_dict['vel_targets'][start_step], np.pi / 2 - res_dict['psi_targets'][start_step]])
-            
-        for step in range(start_step, start_step + num_steps):
-            action = res_dict['actions'][:, step]
-            list_of_arrays.append(action)
-
-            # apply action to get next state
-            next_state = dubins_rollout_cur_state.copy()
-            next_state[0] = dubins_rollout_cur_state[0] + dubins_rollout_cur_state[3] * np.cos(dubins_rollout_cur_state[2])
-            next_state[1] = dubins_rollout_cur_state[1] + dubins_rollout_cur_state[3] * np.sin(dubins_rollout_cur_state[2])
-            next_state[2] = dubins_rollout_cur_state[2] + action[0] # update theta
-            next_state[3] = dubins_rollout_cur_state[3] + action[1] # update vel
-            next_state[4] = next_state[3] * np.cos(next_state[2])
-            next_state[5] = next_state[3] * np.sin(next_state[2])
-
-            next_ideal_state = ideal_dubins_rollout_cur_state.copy()
-            next_ideal_state[0] = ideal_dubins_rollout_cur_state[0] + ideal_dubins_rollout_cur_state[3] * np.cos(ideal_dubins_rollout_cur_state[2])
-            next_ideal_state[1] = ideal_dubins_rollout_cur_state[1] + ideal_dubins_rollout_cur_state[3] * np.sin(ideal_dubins_rollout_cur_state[2])
-            next_ideal_state[2] = ideal_dubins_rollout_cur_state[2] + action[0] # update theta
-            next_ideal_state[3] = ideal_dubins_rollout_cur_state[3] + action[1] # update vel
-            next_ideal_state[4] = next_ideal_state[3] * np.cos(next_ideal_state[2])
-            next_ideal_state[5] = next_ideal_state[3] * np.sin(next_ideal_state[2])
-            
-            dubins_rollout_cur_state = next_state
-            ideal_dubins_rollout_cur_state = next_ideal_state
-
-            LAST_N_STEPS = np.inf
-            if step >= start_step + num_steps - LAST_N_STEPS:
-                # add the last few state
-                list_of_arrays.append(dubins_rollout_cur_state)
-                list_of_arrays.append(ideal_dubins_rollout_cur_state)
-
-        # also add vel and theta targets
-        #list_of_arrays.append([]])
-
-        list_of_arrays.append([1]) # identity term for constant offsets
-
-        return np.concatenate(list_of_arrays)
-
-    def output_obs_func(res_dict, step, num_steps):
-        '''return the output observation vector'''
-
-        f16_state_13d = res_dict['states'][step]
-        x = f16_state_13d[StateIndex.POS_E]
-        y = f16_state_13d[StateIndex.POS_N]
-        heading = np.pi / 2 - f16_state_13d[StateIndex.PSI]
-        vel = f16_state_13d[StateIndex.VT]
-        
-        return np.array([x, y, heading, vel])
-    
     predictor = RegressionPredictor(input_obs_func, output_obs_func)
 
     for num_steps in range(1, MAX_STEPS+1):
-        print(num_steps)
-        predictor.fit(all_f16_res_dicts, num_steps)
+        if trim_to_max_steps:
+            print(f"Trimming data to max {num_steps} steps for predictor")
+            trimmed_res_dicts = []
+            for res_dict in all_f16_res_dicts:
+
+                assert len(res_dict['states']) >= num_steps + 1
+
+                trimmed_res_dict = {
+                    'states': res_dict['states'][:num_steps+1],
+                    'actions': res_dict['actions'][:, :num_steps],
+                    'vel_targets': res_dict['vel_targets'][:num_steps+1],
+                    'psi_targets': res_dict['psi_targets'][:num_steps+1]
+                }
+
+                print(f"trimmed {trimmed_res_dict['states'].shape=}")
+                print(f"trimmed {trimmed_res_dict['actions'].shape=}")
+                print(f"trimmed {trimmed_res_dict['actions']}")
+
+                trimmed_res_dicts.append(trimmed_res_dict)
+
+            predictor.fit(trimmed_res_dicts, num_steps)
+        else:
+
+            print(f"Making predictor for {num_steps} steps")
+
+            # print states[0] shape and actions[0] shape
+            res_dict = all_f16_res_dicts[0]
+            
+
+            predictor.fit(all_f16_res_dicts, num_steps)
+
+        print(f"A.shape: {predictor.A_dict[num_steps].shape}, residuals: {predictor.residuals_dict[num_steps]}")
 
     return predictor
 
@@ -289,7 +335,7 @@ class WingmanF16State:
             power = 9 # engine power level (0-10)
 
             # Default alpha & beta
-            alpha = deg2rad(2.1215) # Trim Angle of Attack (rad)
+            alpha = 0 #deg2rad(2.1215) # Trim Angle of Attack (rad)
             beta = 0                # Side slip angle (rad)
 
             # Initial Attitude
@@ -323,14 +369,14 @@ class WingmanF16State:
 
         
         self.fss = F16SimState(initial_state, self.ap, step=1.0, extended_states=True)
-        #self.fss.integrator_kwargs = {'rtol':1e-5, 'atol':1e-8}
+        self.fss.integrator_kwargs = {'rtol':1e-5, 'atol':1e-8}
 
     def one_step_with_control(self, control):
         '''run one step with the passed in control (rudder, throttle)'''
 
         #print(f".calling one_step_with_control({control}), ap targets: {self.ap.targets}")
 
-        ali_limits = False
+        ali_limits = True
 
         self.ap.targets[0] -= control[0] # modify target heading by rudder control input
 
@@ -345,13 +391,13 @@ class WingmanF16State:
 
             if self.ap.targets[1] + control[1]*k_v < v_min:
                 self.ap.targets[1] = v_min
-                print(f"{self.ap.targets[1]:.2f}, trimming due to min")
+                #print(f"{self.ap.targets[1]:.2f}, trimming due to min")
             elif self.ap.targets[1] + control[1]*k_v > v_max:
                 self.ap.targets[1] = v_max
-                print(f"{self.ap.targets[1]:.2f}, trimming due to max")
+                #print(f"{self.ap.targets[1]:.2f}, trimming due to max")
             else:
                 self.ap.targets[1] += control[1]*k_v
-                print(f"{self.ap.targets[1]:.2f}, no trimming")
+                #print(f"{self.ap.targets[1]:.2f}, no trimming")
 
         self.tmax += 1.0
         self.fss.simulate_to(self.tmax, update_mode_at_start=True) # TODO: check if we need to be increasing the time by 1.0 here
@@ -367,22 +413,35 @@ def load_data_and_sim_f16(dubins_file_path, pkl_hash, single_index=None):
     states_np_list, actions_np_list = data
 
     if single_index is not None:
-        print(f"Using single index {single_index}")
-        states_np_list = [states_np_list[single_index]]
-        actions_np_list = [actions_np_list[single_index]]
+        if isinstance(single_index, int):
+            single_index = (single_index,)
 
+        print(f"Using single index {single_index}")
+        states_np_list_copy = []#states_np_list[single_index]]
+        actions_np_list_copy = []#actions_np_list[single_index]]
+
+        for index in single_index:
+            states_np_list_copy.append(states_np_list[index])
+            actions_np_list_copy.append(actions_np_list[index])
+            
+        states_np_list = states_np_list_copy
+        actions_np_list = actions_np_list_copy
+        
     num_trajectories = len(states_np_list)
 
     all_f16_res_dicts = []
+    
 
     for traj_index in range(num_trajectories):
     #for traj_index in [DEBUG_INDEX]:
         traj_rollout = states_np_list[traj_index]
         actions_rollout = actions_np_list[traj_index]
 
+        #print(f"{single_index[traj_index]}: actions: {actions_rollout}")
+
         # simulate f16
         print(f'Simulating f16 {traj_index+1}/{num_trajectories}', end='', flush=True)
-        f16_res_dict = recreate_trajectory_f16(traj_rollout, actions_rollout)
+        f16_res_dict = recreate_trajectory_f16(traj_index, traj_rollout, actions_rollout)
 
         all_f16_res_dicts.append(f16_res_dict)
 
@@ -406,7 +465,7 @@ def extract_np_states_actions(res_dict):
 
     return f16_np_states, res_dict['actions']
 
-def eval_predictor_accuracy(all_f16_res_dicts, predictor, num_steps_to_predict):
+def eval_predictor_accuracy(all_f16_res_dicts, predictor, num_steps_to_predict, num_trajectories=np.inf, print_dots=False):
     '''evalute the accuracy of a predictive model for a given number of steps
     
     returns max_error_vector, an error vector of max absolute errors for each output dimension
@@ -414,17 +473,25 @@ def eval_predictor_accuracy(all_f16_res_dicts, predictor, num_steps_to_predict):
 
     # all_f16_trajs, actions_np_list
 
-    num_trajectories = len(all_f16_res_dicts)
-    error_vectors = []
-    dubins_error_vectors = []
+    num_trajectories = min(num_trajectories, len(all_f16_res_dicts))
+
+    #print(f'evaluating error with {num_trajectories=}')
+
+    sim_to_error_vectors = []
+    #dubins_error_vectors = []
     max_error_sum_index = -1
     max_error_sum = 0
-    dubins_max_error_sum_index = -1
-    dubins_max_error_sum = 0
+    #dubins_max_error_sum_index = -1
+    #dubins_max_error_sum = 0
 
     dubins = DubinsPredictor()
 
-    for traj_index in [0]: #range(num_trajectories):
+    #print("Note: computing error just for trajectory index 33, not over all")
+
+    for traj_index in range(num_trajectories):
+        if print_dots:
+            print(".", end='', flush=True)
+
         res_dict = all_f16_res_dicts[traj_index]
         num_traj_steps = len(res_dict['states'])
 
@@ -433,64 +500,132 @@ def eval_predictor_accuracy(all_f16_res_dicts, predictor, num_steps_to_predict):
         psi_targets = res_dict['psi_targets']
         f16_np_states, actions_rollout = extract_np_states_actions(res_dict)
 
+        #print(f"{traj_index} - init f16_np_states:\n{f16_states_13d[0]} - {f16_np_states[0]}")
+
         # save the f16 states and actions to 'f16_traj.mat'
-        f16_states16d = f16_states_13d.T
-        savemat(f'f16_traj{traj_index}.mat', {'states16d': f16_states16d, 'states4d': np.array(f16_np_states).T, 'actions': actions_rollout,
-                                              'vel_targets': vel_targets, 'psi_targets': psi_targets})
-        print(f"Saved f16 states and actions to f16_traj{traj_index}.mat")
+        #f16_states16d = f16_states_13d.T
+        #savemat(f'f16_traj{traj_index}.mat', {'states16d': f16_states16d, 'states4d': np.array(f16_np_states).T, 'actions': actions_rollout,
+        #                                      'vel_targets': vel_targets, 'psi_targets': psi_targets})
+        #print(f"Saved f16 states and actions to f16_traj{traj_index}.mat")
+        #print("debug exit")
+        #exit(1)
        
         #f16_np_states = all_f16_trajs[traj_index]
         #actions_rollout = actions_np_list[traj_index]
 
         #assert len(f16_np_states) == actions_rollout.shape[1] + 1, f"expected same number of f16 trajs and actions, got {len(f16_np_states)} and {actions_rollout.shape[1]}"
 
+        error_vectors = []
+        sim_to_error_vectors.append(error_vectors)
+
         for start_step in range(num_traj_steps - (num_steps_to_predict + 1)):
-            
+
 
             #actions_rollout_trimmed = actions_rollout[:, start_step:start_step+(num_steps_to_predict)]
 
             predicted_state = predictor.predict(res_dict, start_step, num_steps_to_predict)
-            dubins_state = dubins.predict(res_dict, start_step, num_steps_to_predict)
+            #dubins_state = dubins.predict(res_dict, start_step, num_steps_to_predict)
 
             abs_pos_error = get_abs_error(predicted_state, f16_np_states[start_step+num_steps_to_predict])
-            dubins_abs_pos_error = get_abs_error(dubins_state, f16_np_states[start_step+num_steps_to_predict])
+            #dubins_abs_pos_error = get_abs_error(dubins_state, f16_np_states[start_step+num_steps_to_predict])
             #print(f"Step {start_step+num_steps_to_predict}: abs_pos_error: {abs_pos_error}")
 
             error_vectors.append(abs_pos_error)
-            dubins_error_vectors.append(dubins_abs_pos_error)
+            #dubins_error_vectors.append(dubins_abs_pos_error)
 
             # update max indices
             error_sum = np.sum(abs_pos_error)
-            dubins_error_sum = np.sum(dubins_abs_pos_error)
+            #dubins_error_sum = np.sum(dubins_abs_pos_error)
 
             if error_sum > max_error_sum:
                 max_error_sum = error_sum
-                max_error_sum_index = start_step
+                #max_error_sum_index = start_step
 
-            if dubins_error_sum > dubins_max_error_sum:
-                dubins_max_error_sum = dubins_error_sum
-                dubins_max_error_sum_index = start_step
 
-    max_error_vector = np.max(np.abs(error_vectors), axis=0)
-    max_dubins_error_vector = np.max(np.abs(dubins_error_vectors), axis=0)
+    flat_error_vectors = sum(sim_to_error_vectors, [])
+    max_error_vector = np.max(np.abs(flat_error_vectors), axis=0)
+    #max_dubins_error_vector = np.max(np.abs(dubins_error_vectors), axis=0)
 
-    print(f"max_error_vector: {max_error_vector}")
-    print(f"max_dubins_error_vector: {max_dubins_error_vector}")
     #print(f"max_error_vector: {max_error_vector}")
-    print()
-    print(f"max_error_sum: {max_error_sum}, index: {max_error_sum_index}")
-    print(f"dubins_max_error_sum: {dubins_max_error_sum}, index: {dubins_max_error_sum_index}")
+    #print(f"max_dubins_error_vector: {max_dubins_error_vector}")
+    #print(f"max_error_vector: {max_error_vector}")
+    #print()
+    #print(f"max_error_sum: {max_error_sum}, at index: {max_error_sum_index}")
+    #print(f"dubins_max_error_sum: {dubins_max_error_sum}, index: {dubins_max_error_sum_index}")
+
+    for sim_index, error_vector in enumerate(sim_to_error_vectors):
+        for step_index, step_error in enumerate(error_vector):
+            
+            #print(f"{sim_index}.{step_index}: {step_error}")
+
+            if step_error[0] == max_error_vector[0]:
+                print(f"  max error for dimension 0 ({step_error[0]}) occurred at sim index {sim_index}.{step_index}")
+
+    if print_dots:
+        print()
 
     return max_error_vector
 
-def plot_prediction_vs_dubins(all_f16_res_dicts, predictor, num_steps_to_predict):
+def plot_single_prediction(traj_index, num_steps, predictor, all_f16_res_dicts):
+        
+    traj_index = 33
+
+    res_dict = all_f16_res_dicts[traj_index]
+    f16_states_13d = res_dict['states']
+
+    # plot initial state
+    
+    plt.figure(figsize=(10, 8))
+    print(f"{f16_states_13d.shape=}")
+    plt.plot(f16_states_13d[:num_steps, StateIndex.POS_E], f16_states_13d[:num_steps, StateIndex.POS_N], 'b-o', label='F-16 Trajectory')
+
+    for num_steps_to_predict in range(1, num_steps):
+        start_step = 0
+        predicted_state = predictor.predict(res_dict, start_step, num_steps_to_predict)
+        residual = predictor.residuals_dict[num_steps_to_predict] 
+        #print(f"{residual=}")
+
+        # plot a box around prediction
+        x = predicted_state[0]
+        y = predicted_state[1]
+        box_width = residual[0, 0]
+        box_height = residual[0,1]
+        rectangle = plt.Rectangle((x - box_width/2, y - box_height/2), box_width, box_height,
+                                  linewidth=1, edgecolor='r', facecolor='none')
+
+        plt.gca().add_patch(rectangle)
+        
+
+
+        
+        #num_traj_steps = len(res_dict['states'])
+
+        
+
+        #start_step = 0
+        #predicted_state = predictor.predict(res_dict, start_step, num_steps_to_predict)
+
+    #plt.show()
+    #print("debug exit")
+    filename = f'plots/!prediction_traj{traj_index}_steps{num_steps}.png'
+    plt.xlabel('Position East (ft)')
+    plt.ylabel('Position North (ft)')
+    plt.title(f'Single Prediction for Trajectory {traj_index} with {num_steps} Steps')
+    plt.legend()
+    plt.savefig(filename)
+    print(f"Made {filename}")
+
+
+def plot_prediction_vs_dubins(all_f16_res_dicts, predictor, num_steps_to_predict, filename_suffix=""):
     '''for each trajectory plot prediction vs dubins vs f16
     '''
 
     num_trajectories = len(all_f16_res_dicts)
     dubins = DubinsPredictor()
 
-    for traj_index in range(num_trajectories):
+    print("compate_util.py: plot_prediction_vs_dubins: Note: plotting just trajectory index 336, not all")
+
+    for traj_index in [336]: #range(num_trajectories):
         res_dict = all_f16_res_dicts[traj_index]
         num_traj_steps = len(res_dict['states'])
 
@@ -501,8 +636,20 @@ def plot_prediction_vs_dubins(all_f16_res_dicts, predictor, num_steps_to_predict
         ax = plot.plot_overhead(res_dict, figsize=(10, 8))
         plt.plot(res_dict['states'][:, StateIndex.POS_E], res_dict['states'][:, StateIndex.POS_N], 'k-', label='F16 recreation')
 
-        for start_step in range(num_traj_steps - (num_steps_to_predict)):
+        #print(f"modified prediction to only first step in compare_util.plot_prediction_vs_dubins")
+        #print(f"Start state: {f16_np_states[0]}, actions: {actions_rollout_full[:, 0]}")
+    
+        #start_step = 0
+        #print(f"res_dict['states'][start_step]: {res_dict['states'][start_step]}")
+        #print(f"res_dict['actions'][:, start_step]: {res_dict['actions'][:, start_step]}")
+        #print(f"res_dict['vel_targets'][start_step]: {res_dict['vel_targets'][start_step]}")
+        #print(f"res_dict['psi_targets'][start_step]: {res_dict['psi_targets'][start_step]}")
 
+        # print step 0 alpha
+        
+
+        for start_step in range(num_traj_steps - (num_steps_to_predict)):
+            #print(f"step {start_step} alpha: {res_dict['states'][start_step, StateIndex.ALPHA]}")
             x = res_dict['states'][:, StateIndex.POS_E][start_step]
             y = res_dict['states'][:, StateIndex.POS_N][start_step]
 
@@ -511,6 +658,9 @@ def plot_prediction_vs_dubins(all_f16_res_dicts, predictor, num_steps_to_predict
 
             regression_xs = [x]
             regression_ys = [y]
+
+            # print out start state for debugging
+            #print(f"start state (step {start_step}): {f16_np_states[start_step]}")
 
             #state0 = f16_np_states[start_step].copy()
 
@@ -535,16 +685,23 @@ def plot_prediction_vs_dubins(all_f16_res_dicts, predictor, num_steps_to_predict
 
 
         ax.legend()
-        filename = f'plots/overhead_{traj_index}.png'
+        filename = f'plots/overhead_{traj_index}{filename_suffix}.png'
         plt.savefig(filename)
         #plt.show()
         plt.close()
         print(f"Made {filename}")
 
-        
 
-def recreate_trajectory_f16(traj_one, actions_one, stdout=True):
+
+def recreate_trajectory_f16(traj_index, traj_one, actions_one, stdout=True, check_norm_diff=True):
     '''run f-16 simulation of the passed-in rollout from saferl'''
+
+    # remove last action
+    actions_one = actions_one[:, :-1]
+
+    # print num steps and actions
+    num_steps = traj_one.shape[1]
+    num_actions = actions_one.shape[1]
 
     init_state = traj_one[:, 0] # x0, y0, heading0, v0
 
@@ -577,6 +734,9 @@ def recreate_trajectory_f16(traj_one, actions_one, stdout=True):
     f16_np_state = np.array([f16_x, f16_y, f16_heading, f16_v])
     f16_np_states.append(f16_np_state)
 
+    # print initial state
+    #print(f"initial state: {f16_np_state}")
+
     for i, action in enumerate(actions_one.T):
         f16.one_step_with_control(action)
 
@@ -601,8 +761,46 @@ def recreate_trajectory_f16(traj_one, actions_one, stdout=True):
         f16_np_state = np.array([f16_x, f16_y, f16_heading, f16_v])
         f16_np_states.append(f16_np_state)
 
+        if check_norm_diff:
+            # check norm difference
+            traj_one_state = traj_one[:, i]
+            f16_np_state = f16_np_states[i]
+
+            #$$print(f"{i=}, f16_np_state: {f16_np_state}, alpha: {last_f16_state[StateIndex.ALPHA]}")
+            x_diff = traj_one_state[0] - f16_np_state[0]
+            y_diff = traj_one_state[1] - f16_np_state[1]
+            norm_diff = np.linalg.norm([x_diff, y_diff])
+            assert norm_diff < 1, f"norm of x/y difference in step {i} of recreation vs eval.log: {norm_diff}"
+            #print(f"step {i} norm difference: {norm_diff}")
+
+
     if stdout:
         print()
+    
+        # debug plot traj_one versus f16_np_states (X and y only) and then show and exit
+
+    # traj_one[:, 0] is # x0, y0, heading0, v0
+    traj_one_xs = traj_one[0, :]
+    traj_one_ys = traj_one[1, :]
+    f16_np_states_array = np.array(f16_np_states).T
+    f16_xs = f16_np_states_array[0, :]
+    f16_ys = f16_np_states_array[1, :]
+
+    colors_f16 = ['r', 'g']
+    colors_dubins = ['b', 'm']
+
+    if False:
+        plt.plot(traj_one_xs, traj_one_ys, f'{colors_dubins[traj_index % len(colors_dubins)]}-', label=f'Dubins Traj {traj_index}')
+        plt.plot(f16_xs, f16_ys, f'{colors_f16[traj_index % len(colors_f16)]}--', label=f'F16 Sim {traj_index}')
+
+        if traj_index == 0:
+            plt.legend()
+            plt.xlabel('X (ft)')
+            plt.ylabel('Y (ft)')
+            plt.title('Trajectory Comparison')
+            plt.show()
+            print("compte_util.py debug exit")
+            exit()
 
     last_state = traj_one[:, -1].copy() # x0, y0, heading0, v0
     last_state[2] = np.pi / 2 - last_state[2] # convert heading to psi
@@ -766,3 +964,83 @@ def get_abs_position_error(traj_one, f16_np_states):
     abs_pos_error = np.linalg.norm(pos_dubins - pos_f16)
 
     return abs_pos_error
+
+@cachier(cache_dir='./cachier')
+def load_data_and_sim_f16_turns(dubins_file_path, pkl_hash, single_index, turn_cmd, num_steps_at_max_turn, seed=0):
+    '''load dubins data from file and recreate using f16 sim'''
+
+    rng = np.random.default_rng(seed)
+
+    with open(dubins_file_path, 'rb') as file:
+        data = pickle.load(file)
+        
+    print(f"Loaded data from {dubins_file_path}")
+    states_np_list, actions_np_list = data
+
+    if single_index is not None:
+        if isinstance(single_index, int):
+            single_index = (single_index,)
+
+        print(f"Using single index {single_index}")
+        states_np_list_copy = []#states_np_list[single_index]]
+        actions_np_list_copy = []#actions_np_list[single_index]]
+
+        for index in single_index:
+            states_np_list_copy.append(states_np_list[index])
+            actions_np_list_copy.append(actions_np_list[index])
+            
+        states_np_list = states_np_list_copy
+        actions_np_list = actions_np_list_copy
+        
+    num_trajectories = len(states_np_list)
+
+    all_f16_res_dicts = []
+    
+
+    for traj_index in range(num_trajectories):
+    #for traj_index in [DEBUG_INDEX]:
+        traj_rollout = states_np_list[traj_index]
+        actions_rollout = actions_np_list[traj_index]
+
+        #print(f"{traj_rollout.shape=}, {actions_rollout.shape=}")
+
+        # traj is 4, 95; actions is 2, 95
+        num_steps = actions_rollout.shape[1]
+        rand_step = rng.integers(1, num_steps-1)
+
+        # inject turn command at random step for num_steps_at_max_turn steps
+        # trim actions_rollout length up to rand_step + num_steps_at_max_turn
+        actions_rollout = actions_rollout[:, :rand_step + num_steps_at_max_turn]
+        actions_rollout[0, rand_step:rand_step+num_steps_at_max_turn] = turn_cmd
+        actions_rollout[1, rand_step:rand_step+num_steps_at_max_turn] = 0 # vel command
+
+        # set traj_rollout to just initial state
+        traj_rollout = traj_rollout[:, :1]
+
+        #print(f"Injected turn command {turn_cmd} at step {rand_step} for {num_steps_at_max_turn} steps")
+        #print(f"action[rand-1]: {actions_rollout[:, rand_step-1]}")
+        #print(f"action[rand]: {actions_rollout[:, rand_step]}")
+        #print(f"action[rand+1]: {actions_rollout[:, rand_step+1]}")
+        #print(f"action[rand+1]: {actions_rollout[:, rand_step+2]}")
+        #print(f"{traj_rollout.shape=}, {actions_rollout.shape=}")
+
+        # simulate f16
+        print(f'Simulating f16 {traj_index+1}/{num_trajectories}', end='', flush=True)
+        full_f16_res_dict = recreate_trajectory_f16(traj_index, traj_rollout, actions_rollout, check_norm_diff=False)
+
+        # f16_res_dict = {'states': np.array(f16.fss.states), 'actions': actions_one, 'times': np.array(f16.fss.times),
+        #    'u_list': f16.fss.u_list, 'ps_list': f16.fss.ps_list, 'Nz_list': f16.fss.Nz_list, 'Ny_r_list': f16.fss.Ny_r_list,
+        #    'vel_targets': vel_targets, 'psi_targets': psi_targets, 'u_refs': u_refs}
+
+        # make trimmed f16_res_dict that starts one step before rand_step
+        trimmed_f16_res_dict = {}
+        trimmed_f16_res_dict['states'] = full_f16_res_dict['states'][rand_step-1:rand_step+num_steps_at_max_turn]
+        trimmed_f16_res_dict['actions'] = full_f16_res_dict['actions'][:, rand_step-1:rand_step+num_steps_at_max_turn]
+
+        # autopilot targets also needed
+        trimmed_f16_res_dict['vel_targets'] = full_f16_res_dict['vel_targets'][rand_step-1:rand_step+num_steps_at_max_turn]
+        trimmed_f16_res_dict['psi_targets'] = full_f16_res_dict['psi_targets'][rand_step-1:rand_step+num_steps_at_max_turn]
+
+        all_f16_res_dicts.append(trimmed_f16_res_dict)
+
+    return all_f16_res_dicts

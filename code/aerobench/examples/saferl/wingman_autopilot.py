@@ -33,7 +33,7 @@ class WingmanAutopilot(Autopilot):
         self.cfg_k_der_psi = 0.5 # orig: 0.5
 
         # Gains for roll tracking
-        self.cfg_k_prop_phi = 0.5 # orig: 0.75
+        self.cfg_k_prop_phi = 1.5 # orig: 0.75
         self.cfg_k_der_phi = 0.5
         self.cfg_max_bank_deg = 80 # maximum bank angle setpoint
         # v2 was 0.5, 0.9
@@ -67,6 +67,8 @@ class WingmanAutopilot(Autopilot):
         ps_cmd = self.track_roll_angle(x_f16, phi_cmd)
 
         nz_cmd = self.track_altitude(x_f16)
+
+        
         throttle = self.track_airspeed(x_f16)
     
 

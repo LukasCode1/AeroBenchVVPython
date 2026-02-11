@@ -58,7 +58,12 @@ class WingmanAutopilot(Autopilot):
     def get_u_ref(self, _t, x_f16):
         '''get the reference input signals'''
 
-    
+        print(f"Time: {_t:.12f}")
+
+        for i in range(13):
+            print(f"x_f16({i+1}): {x_f16[i]:.12f}")
+
+
         psi_cmd = self.targets[0]
 
         # Get desired roll angle given desired heading
@@ -73,8 +78,23 @@ class WingmanAutopilot(Autopilot):
         nz_cmd = max(self.cfg_min_nz_cmd, min(self.cfg_max_nz_cmd, nz_cmd))
         #throttle = max(min(throttle, 1), 0)  # throttle is already limited by low level controller, otherwise it's hard to slow down below uequil
 
+        
+
         # Create reference vector
         rv = [nz_cmd, ps_cmd, 0, throttle]
+
+        print(f"cmds: {nz_cmd:.12f} {ps_cmd:.12f} {throttle:.12f}\n")
+
+        # print the following with %.6f
+        #x_f16[StateIndex.PSI]
+        #x_f16[StateIndex.R]
+        #phi = x_f16[StateIndex.PHI]
+        #p = x_f16[StateIndex.P]
+        #psi_cmd
+        #phi_cmd
+        #print(f"psi: {x_f16[StateIndex.PSI]:.12f}, r: {x_f16[StateIndex.R]:.12f}, phi: {x_f16[StateIndex.PHI]:.12f}" +
+        #      f", p: {x_f16[StateIndex.P]:.12f}, psi_cmd: {psi_cmd:.12f}, phi_cmd: {phi_cmd:.12f}")
+
 
         return rv
     

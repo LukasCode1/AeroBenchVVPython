@@ -13,3 +13,5 @@ TAGS
 __pycache__
 *.pkl
 cachier
+venv_aerobench/
+*aerobench.egg-info*

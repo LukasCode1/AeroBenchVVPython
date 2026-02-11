@@ -244,7 +244,7 @@ def plot_attitude(run_sim_result, title='Attitude History', skip_yaw=True, figsi
     if make_ax:
         plt.tight_layout()
 
-def plot_outer_loop(run_sim_result, title='Outer Loop Controls', ax=None):
+def plot_outer_loop(run_sim_result, title='Outer Loop Controls', ax=None, show=False):
     'plot a single variable over time'
 
     res = run_sim_result
@@ -300,6 +300,9 @@ def plot_outer_loop(run_sim_result, title='Outer Loop Controls', ax=None):
 
     if make_ax:
         plt.tight_layout()
+
+    if show:
+        plt.show()
 
 def plot_inner_loop(run_sim_result, title='Inner Loop Controls', ax=None):
     'plot inner loop controls over time'
