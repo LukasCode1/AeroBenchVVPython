@@ -69,6 +69,7 @@ def linf_best_fit(input_array, output_array):
         linf_minimize_residuals: (K,) array of sum of absolute residuals per output dimension
     """
 
+
     input_array = np.asarray(input_array)
     output_array = np.asarray(output_array)
     M, N = input_array.shape
@@ -78,6 +79,10 @@ def linf_best_fit(input_array, output_array):
 
     if M != M2:
         raise ValueError("Number of rows in input_array and output_array must match.")
+    
+    # add a check for underdetermined system (more features than samples)
+    if N > M:
+        print(f"Warning (linf_best_fit): Underdetermined system (N={N} > M={M}). L_inf optimization may fail or give non-unique solutions.")
 
     # We will solve column by column
     A_list = []
@@ -286,7 +291,7 @@ def make_linear_predictor(all_f16_res_dicts, MAX_STEPS, trim_to_max_steps=False)
             trimmed_res_dicts = []
             for res_dict in all_f16_res_dicts:
 
-                assert len(res_dict['states']) >= num_steps + 1
+                assert res_dict['states'].shape[1] >= num_steps + 1, f"{res_dict['states'].shape=} < {num_steps + 1=}"
 
                 trimmed_res_dict = {
                     'states': res_dict['states'][:num_steps+1],
@@ -295,9 +300,9 @@ def make_linear_predictor(all_f16_res_dicts, MAX_STEPS, trim_to_max_steps=False)
                     'psi_targets': res_dict['psi_targets'][:num_steps+1]
                 }
 
-                print(f"trimmed {trimmed_res_dict['states'].shape=}")
-                print(f"trimmed {trimmed_res_dict['actions'].shape=}")
-                print(f"trimmed {trimmed_res_dict['actions']}")
+                #print(f"trimmed {trimmed_res_dict['states'].shape=}")
+                #print(f"trimmed {trimmed_res_dict['actions'].shape=}")
+                #print(f"trimmed {trimmed_res_dict['actions']}")
 
                 trimmed_res_dicts.append(trimmed_res_dict)
 
@@ -965,15 +970,17 @@ def get_abs_position_error(traj_one, f16_np_states):
 
     return abs_pos_error
 
+
+
 @cachier(cache_dir='./cachier')
-def load_data_and_sim_f16_turns(dubins_file_path, pkl_hash, single_index, turn_cmd, num_steps_at_max_turn, seed=0):
+def load_data_and_sim_f16_turns(dubins_file_path, pkl_hash, single_index, turn_cmd, num_steps_at_max_turn, seed=0, SAMPLES_PER_TRAJ = 5):
     '''load dubins data from file and recreate using f16 sim'''
 
     rng = np.random.default_rng(seed)
 
     with open(dubins_file_path, 'rb') as file:
         data = pickle.load(file)
-        
+
     print(f"Loaded data from {dubins_file_path}")
     states_np_list, actions_np_list = data
 
@@ -988,59 +995,54 @@ def load_data_and_sim_f16_turns(dubins_file_path, pkl_hash, single_index, turn_c
         for index in single_index:
             states_np_list_copy.append(states_np_list[index])
             actions_np_list_copy.append(actions_np_list[index])
-            
+
         states_np_list = states_np_list_copy
         actions_np_list = actions_np_list_copy
-        
+
     num_trajectories = len(states_np_list)
 
     all_f16_res_dicts = []
-    
+
 
     for traj_index in range(num_trajectories):
     #for traj_index in [DEBUG_INDEX]:
-        traj_rollout = states_np_list[traj_index]
-        actions_rollout = actions_np_list[traj_index]
+        traj_rollout_orig = states_np_list[traj_index]
+        actions_rollout_orig = actions_np_list[traj_index]
 
-        #print(f"{traj_rollout.shape=}, {actions_rollout.shape=}")
+        for sample_idx in range(SAMPLES_PER_TRAJ):
+            traj_rollout = traj_rollout_orig.copy()
+            actions_rollout = actions_rollout_orig.copy()
 
-        # traj is 4, 95; actions is 2, 95
-        num_steps = actions_rollout.shape[1]
-        rand_step = rng.integers(1, num_steps-1)
+            # traj is 4, 95; actions is 2, 95
+            num_steps = actions_rollout.shape[1]
+            rand_step = rng.integers(1, num_steps - 1)
 
-        # inject turn command at random step for num_steps_at_max_turn steps
-        # trim actions_rollout length up to rand_step + num_steps_at_max_turn
-        actions_rollout = actions_rollout[:, :rand_step + num_steps_at_max_turn]
-        actions_rollout[0, rand_step:rand_step+num_steps_at_max_turn] = turn_cmd
-        actions_rollout[1, rand_step:rand_step+num_steps_at_max_turn] = 0 # vel command
+            # build actions_rollout of exactly rand_step + num_steps_at_max_turn columns
+            desired_len = rand_step + num_steps_at_max_turn
+            new_actions = np.zeros((2, desired_len))
+            new_actions[:, :rand_step] = actions_rollout[:, :rand_step]
+            new_actions[0, rand_step:] = turn_cmd
+            new_actions[1, rand_step:] = 0 # vel command
+            actions_rollout = new_actions
 
-        # set traj_rollout to just initial state
-        traj_rollout = traj_rollout[:, :1]
+            assert actions_rollout.shape[1] == desired_len, f"expected {desired_len} action columns, got {actions_rollout.shape[1]}"
 
-        #print(f"Injected turn command {turn_cmd} at step {rand_step} for {num_steps_at_max_turn} steps")
-        #print(f"action[rand-1]: {actions_rollout[:, rand_step-1]}")
-        #print(f"action[rand]: {actions_rollout[:, rand_step]}")
-        #print(f"action[rand+1]: {actions_rollout[:, rand_step+1]}")
-        #print(f"action[rand+1]: {actions_rollout[:, rand_step+2]}")
-        #print(f"{traj_rollout.shape=}, {actions_rollout.shape=}")
+            # set traj_rollout to just initial state
+            traj_rollout = traj_rollout[:, :1]
 
-        # simulate f16
-        print(f'Simulating f16 {traj_index+1}/{num_trajectories}', end='', flush=True)
-        full_f16_res_dict = recreate_trajectory_f16(traj_index, traj_rollout, actions_rollout, check_norm_diff=False)
+            # simulate f16
+            print(f'Simulating f16 traj {traj_index+1}/{num_trajectories} sample {sample_idx+1}/{SAMPLES_PER_TRAJ}', end='', flush=True)
+            full_f16_res_dict = recreate_trajectory_f16(traj_index, traj_rollout, actions_rollout, check_norm_diff=False)
 
-        # f16_res_dict = {'states': np.array(f16.fss.states), 'actions': actions_one, 'times': np.array(f16.fss.times),
-        #    'u_list': f16.fss.u_list, 'ps_list': f16.fss.ps_list, 'Nz_list': f16.fss.Nz_list, 'Ny_r_list': f16.fss.Ny_r_list,
-        #    'vel_targets': vel_targets, 'psi_targets': psi_targets, 'u_refs': u_refs}
+            # make trimmed f16_res_dict that starts one step before rand_step
+            trimmed_f16_res_dict = {}
+            trimmed_f16_res_dict['states'] = full_f16_res_dict['states'][rand_step-1:rand_step+num_steps_at_max_turn]
+            trimmed_f16_res_dict['actions'] = full_f16_res_dict['actions'][:, rand_step-1:rand_step+num_steps_at_max_turn]
 
-        # make trimmed f16_res_dict that starts one step before rand_step
-        trimmed_f16_res_dict = {}
-        trimmed_f16_res_dict['states'] = full_f16_res_dict['states'][rand_step-1:rand_step+num_steps_at_max_turn]
-        trimmed_f16_res_dict['actions'] = full_f16_res_dict['actions'][:, rand_step-1:rand_step+num_steps_at_max_turn]
+            # autopilot targets also needed
+            trimmed_f16_res_dict['vel_targets'] = full_f16_res_dict['vel_targets'][rand_step-1:rand_step+num_steps_at_max_turn]
+            trimmed_f16_res_dict['psi_targets'] = full_f16_res_dict['psi_targets'][rand_step-1:rand_step+num_steps_at_max_turn]
 
-        # autopilot targets also needed
-        trimmed_f16_res_dict['vel_targets'] = full_f16_res_dict['vel_targets'][rand_step-1:rand_step+num_steps_at_max_turn]
-        trimmed_f16_res_dict['psi_targets'] = full_f16_res_dict['psi_targets'][rand_step-1:rand_step+num_steps_at_max_turn]
-
-        all_f16_res_dicts.append(trimmed_f16_res_dict)
+            all_f16_res_dicts.append(trimmed_f16_res_dict)
 
     return all_f16_res_dicts

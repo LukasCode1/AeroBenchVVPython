@@ -19,7 +19,7 @@ def load(psidot_max, num_steps_at_max_turn):
     file_hash = hash_file(dubins_file_path)
     print(f"SHA-256 hash of {dubins_filename}: {file_hash}")
 
-    MAX_INDEX = 20
+    MAX_INDEX = 400
     odd_indices = tuple(range(1, MAX_INDEX, 2))
     even_indices = tuple(range(0, MAX_INDEX, 2))
 
