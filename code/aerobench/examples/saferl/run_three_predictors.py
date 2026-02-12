@@ -40,13 +40,13 @@ def main():
     psidot_max = 10*np.pi/180
     lead_res_dicts, wingman_res_dicts, wingman_right_res_dicts, wingman_left_res_dicts = load(psidot_max, MAX_STEPS_TO_PREDICT)
 
-    for label, res_dicts, trim_to_max_steps in [('lead', lead_res_dicts, False), ('wingman', wingman_res_dicts, False), 
-                             ('wingman_right', wingman_right_res_dicts, True), ('wingman_left', wingman_left_res_dicts, True)]:
+    for label, res_dicts, trim_to_max_steps, turn_cmd in [('lead', lead_res_dicts, False, 0.0), ('wingman', wingman_res_dicts, False, -999), 
+                             ('wingman_right', wingman_right_res_dicts, True, psidot_max), ('wingman_left', wingman_left_res_dicts, True, -psidot_max)]:
         print("------------")
         print(f'--- {label} ---')
         predictor = make_linear_predictor(res_dicts, MAX_STEPS_TO_PREDICT, trim_to_max_steps)
            
-        data = {'max_steps': MAX_STEPS_TO_PREDICT}
+        data = {'max_steps': MAX_STEPS_TO_PREDICT, 'turn_cmd': turn_cmd}
 
         for step in range(1, MAX_STEPS_TO_PREDICT+1):
             A = predictor.A_dict[step]
