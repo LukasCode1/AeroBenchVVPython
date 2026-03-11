@@ -71,10 +71,11 @@ def main():
         for sim_step in range(1, total_sim_steps + 1):
             step_time = round(sim_step * STEP_DELTA, 10)
             step_str = str(step_time)           # "0.25", "0.5", ..., "5.0"
+            mat_key = step_str.replace('.', '_')  # "0_25", "0_5", ..., "5_0"
             A = predictor.A_dict[sim_step]
             residuals = predictor.residuals_dict[sim_step]
-            data[f'A_{step_str}'] = A
-            data[f'residuals_{step_str}'] = residuals
+            data[f'A_{mat_key}'] = A
+            data[f'residuals_{mat_key}'] = residuals
             print(f"  t={step_str}s: residuals={residuals}")
 
         # Compare new residuals vs old at integer steps
