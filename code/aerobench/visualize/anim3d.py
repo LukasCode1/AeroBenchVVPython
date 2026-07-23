@@ -336,8 +336,8 @@ def make_anim(res, filename, viewsize=1000, viewsize_z=1000, f16_scale=30, trail
     if filename is not None:
 
         if filename.endswith('.gif'):
-            print("\nSaving animation to '{}' using 'imagemagick'...".format(filename))
-            anim_obj.save(filename, dpi=60, writer='imagemagick') # dpi was 80
+            print("\nSaving animation to '{}' using 'pillow'...".format(filename))
+            anim_obj.save(filename, dpi=60, writer='pillow') # dpi was 80
             print("Finished saving to {} in {:.1f} sec".format(filename, time.time() - start))
         else:
             fps = 40
